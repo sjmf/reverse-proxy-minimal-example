@@ -4,7 +4,7 @@ services:
   gunicorn:
     build:
       context: ./server
-    command: gunicorn --worker-tmp-dir /dev/shm --workers=2 --threads=4 --worker-class=gthread --timeout=120 --log-level=DEBUG --log-file=- --bind 0.0.0.0:5000 'server:app'
+    command: gunicorn --log-level=DEBUG --log-file=- --bind 0.0.0.0:5000 'server:app'
     environment:
       - FLASK_ENV=production
       - LOG_LEVEL=DEBUG
