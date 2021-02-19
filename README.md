@@ -1,77 +1,125 @@
-# Gunicorn & Nginx Flask / Werkzeug ProxyFix Minimal Example
+# Gunicorn & Nginx Flask / Werkzeug ProxyFix under Docker
 
-When running Flask apps under gunicorn, it is often desirable to 
-place it behind a reverse proxy. Nginx is a popular choice for this.
+When running Flask apps under gunicorn, it is often desirable to place it behind 
+a reverse proxy. Nginx is a popular choice for this. Further, Docker can be used 
+to containerize these apps, separating the nginx container from the gunicorn one
+running the web app.
 
-In some web applications*, it is desirable to run the Flask server
+In such web applications*, it can be desirable to run the Flask server
 under a path prefix, for example `/api`. Nginx can be configured to ProxyPass
 requests made to this URL prefix.
 
-Some API routes may not have an immediate result. In this case, we redirect to
-another URL to retrieve results. For redirecting to another route, the 
-preferred method is to use `url_for` in Flask. This introduces a problem,
-as `url_for` seems to [return absolute URLs](https://stackoverflow.com/a/22707491/1681205) 
-for redirects**.
+Further, some API routes may not have an immediate result. In this case, we return a
+`30x` redirect to another `Location:` to retrieve results. For assembling this
+path string, the preferred method is to use Flask's `url_for` method.
 
+The desired behaviour is as follows:
+* User's browser requests http://externalserver:8000/api/
+* Flask (under gunicorn) triggers the index `/` route for the application server
+* A `30x` redirect is returned to the browser, with the header `Location: 
+  http://externalserver:8000/api/result`
+* The browser makes a HTTP request to this URL, which triggers the Flask app 
+  route `/result`, which returns `200 OK` and the result.
+
+## The Problem
+Redirects in Flask always seem to point to 
+[absolute URLs](https://stackoverflow.com/a/22707491/1681205)**. When running 
+under Docker, this URL will be incorrect, as the server builds a URL for the 
+internal DNS address of the container:
+
+`http://gunicorn:5000/api/` __(wrong!)__
+
+
+## Enter ProxyFix
 The werkzeug middleware [ProxyFix](https://werkzeug.palletsprojects.com/en/1.0.x/middleware/proxy_fix/)
-is the suggested fix to work around this, along with an appropriate [nginx config](https://flask.palletsprojects.com/en/1.1.x/deploying/wsgi-standalone/#proxy-setups)
-which passes `X-Forwarded-` headers to inform the WSGI server of the appropriate
+is the suggested fix (or work-around) for this, along with an appropriate 
+[nginx config](https://flask.palletsprojects.com/en/1.1.x/deploying/wsgi-standalone/#proxy-setups)
+which passes `X-Forwarded-` headers to inform the WSGI server of the user-facing
+server's original address.
 
 ```python
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)
 ```
 
-Without ProxyFix, `url_for` redirects to the wrong address: the internal address
-of the server. In the context of this project, this results in a redirect to the URI 
-`http://gunicorn:5000`. ProxyFix solves this by building a URL from the constituent 
+ProxyFix attempts to solve this by building a URL from the constituent 
 parts in the `X-Forwarded-` headers. This is achieved using an Nginx location block:
 
 ```
 location ^~ /api/ {
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $real_scheme;
-    proxy_set_header X-Scheme $real_scheme;
-    proxy_set_header Host $host;
     proxy_set_header X-Forwarded-Host $host;
     proxy_set_header X-Forwarded-Port $server_port;
-    proxy_set_header X-Forwarded-Prefix api;
 
-    # Use a trailing slash to trim the /api/ bit: https://serverfault.com/a/562850/172045
-    proxy_pass http://gunicorn:5000/;
+    proxy_pass http://gunicorn:5000/api/;
     proxy_redirect off;
 }
 ```
 
-(It'd be nice if we could just have `url_for` return
-a relative URL for a redirect, but I have been unsuccessful in attempts to 
-achieve this.***)
+I previously used a trailing slash in the nginx config to trim the `/api/` 
+bit, per [https://serverfault.com/a/562850/172045](https://serverfault.com/a/562850/172045).
+However, [this article](https://dlukes.github.io/flask-wsgi-url-prefix.html)
+provides a minimal working example of how to configure this which explicitly 
+recommends against that. It was there that I discovered that providing the 
+`SCRIPT_NAME` environment variable will tell Flask to use a URL prefix: 
 
-However, using ProxyFix has led to some issues. In particular, it 
-seems to ignore the `X-Forwarded-Port` directive, even though it is visible
-in the HTTP headers received by Flask and the [source code](https://github.com/pallets/werkzeug/blob/0fff5272c481d71b991dff296adb960f674a512a/src/werkzeug/middleware/proxy_fix.py#L154)
-definitely checks for and sets variables for this.
+`SCRIPT_NAME=/api`
 
-Other suggestions include setting `APPLICATION_ROOT` and `SERVER_NAME`. However,
-Flask only uses these [when generating URLs outside a request](https://github.com/pallets/flask/issues/3219#issuecomment-496237364)
+### Further debugging...
+Initially, ProxyFix seemed to _completely ignore_ the `X-Forwarded-Port` directive 
+in the redirected-to Location, even though it is visible in the HTTP headers 
+received by Flask and the [source code](https://github.com/pallets/werkzeug/blob/0fff5272c481d71b991dff296adb960f674a512a/src/werkzeug/middleware/proxy_fix.py#L154)
+shows that it definitely checks for and sets the variables based on this.
 
-This repo is a work-in-progress to find a solution, and will be updated in due course. 
+If we output the full external URL, using ProxyFix, from url_for, the port is trimmed:
+
+`http://localhost/api/` (:8000 missing!)
+
+This is because nginx (in its Docker container) was running on port 80, so `X_FORWARDED_PORT`
+was actually set to `:80`. Docker mapped this port to :8000 externally. The 'true' port can 
+be mapped using an nginx mapping, per
+[https://stackoverflow.com/a/63366106/1681205](https://stackoverflow.com/a/63366106/1681205):
+
+```
+map $http_host $port {
+    default $server_port;
+    "~^[^\:]+:(?<p>\d+)$" $p;
+}
+```
+
+Finally, a similar technique can be used to set the URI scheme to the external one:
+[https://serverfault.com/a/516382/172045](https://serverfault.com/a/516382/172045)
+
+```
+map $http_x_forwarded_proto $real_scheme {
+    default $scheme;
+    https "https";
+}
+```
+
+# Solution
+This repo contains a minimal worked example of a Flask app running in this configuration.
 
 ---
+### Footnotes
 
 (*) One example would be using a Vue app with [Vue Router](https://router.vuejs.org/guide/essentials/history-mode.html)
 in HTML5 history mode. In that case, all requests other than `/api/` prefixed
 requests go to the single page app.
 
 (**) The HTTP RFC for 3xx redirects [was updated](https://tools.ietf.org/html/rfc7231)
-in 2014 to permit relative Location URIs redirects with e.g. `303 SEE OTHER`.
+in 2014 to permit relative Location URIs redirects with e.g. `303 SEE OTHER`. It'd be 
+nice if we could just have `url_for` return a relative URL for a redirect, but I have 
+so far been unsuccessful in attempts to achieve this. ***
 
 (***) [It has been claimed](https://stackoverflow.com/a/12162726/1681205) that
 an `_external` keyword needs to be set to return absolute (rather than 
-relative) URLS. In my testing, it appears that 3xx redirects always return an 
-absolute URL anyway, so the `_external` parameter does nothing.
+relative) URLs. In my testing, it appears that `3xx` redirects always return an 
+absolute URL anyway, so setting `_external=False` in `url_for` does nothing.
 
-(****) The development server doesn't handle mounting apps anywhere but the root.
-The suggested fix is to use `DispatcherMiddleware` (see link).
-This is good to know for debugging, but not useful for production deployment.
+(****) Other suggestions include setting `APPLICATION_ROOT` and `SERVER_NAME`. However,
+Flask only uses these [when generating URLs outside a request](https://github.com/pallets/flask/issues/3219#issuecomment-496237364).
+
+NB: The development server doesn't handle mounting apps anywhere but the root.
+The suggested fix is to use `DispatcherMiddleware` (see link below). This problem
+isn't related. It's good to know for debugging, but not useful for production deployment.
 [https://github.com/pallets/flask/issues/2759#issuecomment-386887290](https://github.com/pallets/flask/issues/2759#issuecomment-386887290)
