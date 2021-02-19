@@ -1,0 +1,31 @@
+version: '3.6'
+
+services:
+  gunicorn:
+    build:
+      context: ./server
+    command: gunicorn --worker-tmp-dir /dev/shm --workers=2 --threads=4 --worker-class=gthread --timeout=120 --log-level=DEBUG --log-file=- --bind 0.0.0.0:5000 'server:app'
+    environment:
+      - FLASK_ENV=production
+      - LOG_LEVEL=DEBUG
+    expose:
+      - 5000
+    networks:
+      - backend
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "8000:80/tcp"
+    depends_on:
+      - gunicorn
+    networks:
+      - backend
+      - default
+
+networks:
+  backend:
+    driver: bridge
+  default:
+
