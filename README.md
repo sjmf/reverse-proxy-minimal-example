@@ -56,8 +56,9 @@ location ^~ /api/ {
 }
 ```
 
-This example only sets x_host and x_for. The version in the repository sets all
-headers supported by ProxyFix: see the files `conf/subsite.conf` and `server.py`
+This example only sets x_host and x_port. The version in the repository sets all
+headers supported by ProxyFix: see the files [subsite.conf](frontend/conf/subsite.conf) 
+and [server.py](server/server.py)
 for details. The headers to look for must be declared to ProxyFix and defined
 in the nginx config.
 
@@ -65,10 +66,15 @@ I previously used a trailing slash in the nginx config to trim the `/api/`
 bit, per [https://serverfault.com/a/562850/172045](https://serverfault.com/a/562850/172045).
 However, [David Lukeš' article on mounting Flask under a URL prefix](https://dlukes.github.io/flask-wsgi-url-prefix.html)
 provides an example of how to configure this which explicitly 
-recommends against that[3]. It was there that I discovered that providing the 
+recommends against that [3]. It was there that I discovered that providing the 
 `SCRIPT_NAME` environment variable will tell Flask to use a URL prefix: 
 
 `SCRIPT_NAME=/api`
+
+This seems to be required even if passing `X-Forwarded-Prefix`! I'm not 
+entirely sure why it's not enough to just pass this header and let ProxyFix
+handle it, but for now I've included this environment variable in the 
+`docker-compose.yml` config.
 
 ## Gotchas
 Initially, ProxyFix seemed to _completely ignore_ the `X-Forwarded-Port` directive 
@@ -93,7 +99,19 @@ map $http_host $port {
 ```
 
 In production, you may be running on port 80 regardless, so this lack of 
-redirection would normally be invisible.
+redirection would normally be invisible. **OR** you might be running behind another
+load-balancing server, such as [traefik](https://traefik.io), in which case
+it might be desirable to pass through your own `$http_x_forwarded_*` headers. This can
+be achieved by passing them through in the nginx config: 
+
+```
+proxy_set_header X-Forwarded-Port $http_x_forwarded_port;
+```
+
+You can even chain these by setting it to `$http_x_forwarded_port,$port` in the nginx
+config, and then updating the ProxyFix configuration in [server.py](server/server.py#L5)
+to indicate that it should respect more layers of reverse proxy, like this: 
+`ProxyFix(app.wsgi_app, x_port=2)`.
 
 Finally, a similar technique can be used to set the URI scheme to the external one:
 [https://serverfault.com/a/516382/172045](https://serverfault.com/a/516382/172045)
